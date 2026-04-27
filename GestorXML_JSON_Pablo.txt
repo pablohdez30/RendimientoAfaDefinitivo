@@ -1,0 +1,721 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using SLB.DBManager;
+using SLB.GeneracionEstados;
+using SLB.ObjRemotos.Captura;
+using SLB.ObjRemotos.Estado;
+using SLB.Utils;
+using SLB.Utils.Servidor;
+
+namespace SLB.ObjRemotos.Comun
+{
+    public partial class GestorXml : IGestorXml
+    {
+        public MemoryStream GenerarJSON(string vIdSesion, string pLogin, string pUsuario, string pIdioma, string pIp, string esquemaBD,
+            Dictionary<string, modeloEstado> vEstadosEnvio, Dictionary<string, modeloEstado> vEstadosFaltan,
+            string vGrupoEnvio  //creo que es el módulo o grupo de envío, no el grupo entidad
+            , string vEntidad //entidad declarante
+            , string vFechaDatos, string vNumEnvio, string vPuntoEntrada,
+            int vPeriodicidad, int? vSumaFechaDatos, string vNombreFicheroAGuardar, bool vEsIndividual)
+        {
+
+            System.Reflection.MethodBase metodo = System.Reflection.MethodBase.GetCurrentMethod();
+            string llamadaMetodo = metodo.DeclaringType.FullName + "." + metodo.Name;
+            string llamadaParametros = SLB.ObjRemotos.TraceServidor.Trace.GetStringParametros(metodo, vIdSesion, pLogin, pUsuario, pIdioma, pIp, esquemaBD,
+                vEstadosEnvio?.Count, vEstadosFaltan?.Count,
+                vGrupoEnvio, vEntidad, vFechaDatos, vNumEnvio, vPuntoEntrada,
+                vPeriodicidad, vSumaFechaDatos, vNombreFicheroAGuardar);
+
+            bool nombreFicheroAGuardarEstaVacio = String.IsNullOrEmpty(vNombreFicheroAGuardar);
+
+            try
+            {
+                // 1. Declaración y llenado de variables
+                Comun.TablasTipos tt = new Comun.TablasTipos();
+                Comun.GrupoMultientidad GrupoEnvio = tt.getGrupoMultientidad(vIdSesion, int.Parse(vEntidad), pIdioma);
+
+                string nombreFichero;
+                if (nombreFicheroAGuardarEstaVacio)
+                {
+                    // NOS FIJAREMOS EN EL NOMBRE_FICHERO DEL GRUPO ENVIO Y SI ESTA RELLENO UTILIZAREMOS ESE NOMBRE SINO SEGUIREMOS 
+                    // ReportSubject_Country_FrameworkCodeModuleVersion_Module_ReferenceDate_CreationTimestamp.zip
+                    // YYYY-MM-DD
+                    // YYYYMMDDhhmmssfff
+                    // CODIGOLEI_PAIS_FRAMEWORKXXYYZZ_VERSIONMODULOJSON_FECHAREFERENCIA_TIMESTAMP.ZIP
+                    nombreFichero = String.Format("{0}_{1}_{2}_{3:yyyy-MM-dd}_{4:yyyyMMddhhmmssfff}", GrupoEnvio.CodigoLEI, GrupoEnvio.CodigoEntidadExportacion, vGrupoEnvio, DateTime.ParseExact(vFechaDatos, "yyyyMMdd", CultureInfo.CurrentCulture), DateTime.Now);
+                }
+                else
+                {
+                    nombreFichero = vNombreFicheroAGuardar;
+                }
+
+                #region Rellenado de listas de informes a considerar en el JSON
+                // 2a. Se rellena la lista de informes a enviar 
+
+                List<InformeSecuencia> vInformes = new List<InformeSecuencia>();
+                try
+                {
+                    //JBS 27/02/2024: ORDENAMOS EL DICCIONARIO DE ESTADOS (SI FALLA LO DEJAMOS COMO ANTES)
+                    List<KeyValuePair<string, modeloEstado>> myListVEstadosEnvio = vEstadosEnvio.ToList();
+
+                    myListVEstadosEnvio.Sort(
+                        delegate (KeyValuePair<string, modeloEstado> pair1,
+                        KeyValuePair<string, modeloEstado> pair2)
+                        {
+                            return pair1.Key.CompareTo(pair2.Key);
+                        }
+                    );
+
+                    foreach (var informe in myListVEstadosEnvio)
+                    {
+                        Captura.InformeSecuencia inf = new Captura.InformeSecuencia();
+                        inf.BorrarEstado = false;
+                        inf.Id_Informe = informe.Key.PadLeft(4, '0') + (!string.IsNullOrWhiteSpace(informe.Value.version) ? informe.Value.version : "");
+
+                        inf.Id_Oficial_Informe = informe.Value.idOriginalInforme;
+
+                        // TODO: Le pongo 1 por defecto cuando no viene informado. Preguntar a Juanma.
+                        inf.Secuencia = (string.IsNullOrWhiteSpace(informe.Value.secuencia)) ? 1 : int.Parse(informe.Value.secuencia);
+
+                        vInformes.Add(inf);
+                    }
+                }
+                catch (Exception /*ex*/) //Se comenta la variable ex ya que nunca se usa
+                {
+                    foreach (var informe in vEstadosEnvio)
+                    {
+                        Captura.InformeSecuencia inf = new Captura.InformeSecuencia();
+                        inf.BorrarEstado = false;
+                        inf.Id_Informe = informe.Key + (!string.IsNullOrWhiteSpace(informe.Value.version) ? informe.Value.version : "");
+
+                        inf.Id_Oficial_Informe = informe.Value.idOriginalInforme;
+
+                        // Le pongo 1 por defecto cuando no viene informado. No debería de llegar a pasar.
+                        inf.Secuencia = (string.IsNullOrWhiteSpace(informe.Value.secuencia)) ? 1 : int.Parse(informe.Value.secuencia);
+
+                        vInformes.Add(inf);
+                    }
+                }
+
+                // 2c. Se rellena la lista de informes vacíos
+                List<string[]> vFaltan = new List<string[]>();
+                foreach (var informe in vEstadosFaltan)
+                {
+                    vFaltan.Add(new string[] { informe.Key, informe.Value.idOriginalInforme });
+                }
+                #endregion
+
+                string strXbrl = string.Empty;
+
+
+                string reportingEntity = SIRBE.Servicios.Arranque.SVC.GestorConfiguracion.DameValorParametroOnLineModuloConfiguracionElemento(
+                            pLogin, pUsuario, vIdSesion, pIdioma, pIp, "8080", vEntidad, "AFA", "REPORTING.ENTITY");
+
+                string utfConBom = null;
+
+                try
+                {
+                    utfConBom = SIRBE.Servicios.Arranque.SVC.GestorConfiguracion.DameValorParametroOnLineModuloConfiguracionElemento(
+                                pLogin, pUsuario, vIdSesion, pIdioma, pIp, "8080", vEntidad, "AFA", "REPORTING.UTF_CON_BOM");
+                }
+                catch (Exception /*ex*/) //Se comenta la variable ex ya que nunca se usa
+                {
+                    // CRR SI no existe el paramtro lo paro con el pechito
+                }
+
+
+
+                string pRutaServidor = string.Empty;
+                #region Generación de JSON  ************************************************************************************
+                MemoryStream ficheroZIP = DevolverJSON(vIdSesion, pIdioma, vInformes, vFaltan, vFechaDatos, vGrupoEnvio, vEntidad, vPuntoEntrada, vPeriodicidad
+                    , vSumaFechaDatos, nombreFichero, vEsIndividual, reportingEntity, utfConBom, out pRutaServidor);
+
+
+
+
+                #endregion *********************************************************************************************************
+
+
+
+                //¿¿¿Por qué se audita GenerarXBRLCSV y no GenerarXBRL???? Los dos métodos deberían hacer lo mismo y auditar los dos o ninguno.
+                #region Auditoria 
+                //05/02/2025 CRD: Auditoria exportar XBRL CSV
+                /*
+                GestorInformacion gi = new GestorInformacion();
+                string vEsOrdinarioAuditar = vEsOrdinario ? "1" : "0";
+                string vModo = vGenerarEnServidor ? "1" : "0";
+                List<string> datosJson = new List<string>() {
+                    UtilsString.FormateaValorJson<string>("Modulo", vGrupoEnvio),
+                    UtilsString.FormateaValorJson<string>("Entidad", vEntidad),
+                    UtilsString.FormateaValorJson<string>("FechaDatos", vFechaDatos),                    
+                    UtilsString.FormateaValorJson<string>("NumeroEnvio", vNumEnvio),
+                    UtilsString.FormateaValorJson<string>("EstadosEnvio", vEstadosEnvio.Count),
+                    UtilsString.FormateaValorJson<string>("EstadosFaltan", vEstadosFaltan.Count),
+                    UtilsString.FormateaValorJson<string>("Periodicidad", vPeriodicidad),
+                    UtilsString.FormateaValorJson<string>("Ordinario", vEsOrdinarioAuditar),
+                    UtilsString.FormateaValorJson<string>("Formato", "XBRL/CSV"),
+                    UtilsString.FormateaValorJson<string>("GenerarEnServidor", vModo),
+                    UtilsString.FormateaValorJson<string>("Modo", pModo)
+                };
+                List<string> datos = new List<string>() { vEstadosEnvio.Count.ToString(), vEstadosFaltan.Count.ToString(), vGrupoEnvio, vEntidad, vFechaDatos, vNumEnvio, vPeriodicidad.ToString(), vEsOrdinarioAuditar, "XBRL/CSV", vModo, pModo };
+                gi.Auditar(vIdSesion, pUsuario, pLogin, pIdioma, pIp, ConstantesAuditoria.ENVIO_GET_XBRL, datosJson, datos);
+                */
+                #endregion
+
+                return ficheroZIP;
+            }
+            catch (Exception ex)
+            {
+                string stack = SLB.ObjRemotos.TraceServidor.Trace.GetStackTrace(ex);
+                string mensaje = string.Format("Error en {0}({1}:{2})", llamadaMetodo, llamadaParametros, stack);
+                TraceServidor.Trace.ShowError(pUsuario, vIdSesion, pIp, pIdioma, llamadaMetodo, mensaje, ex);
+                throw;
+            }
+        }
+
+        private MemoryStream DevolverJSON(string vIdSesion, string pIdioma, List<InformeSecuencia> vInformes, List<string[]> vFaltan, string vFechaDatos
+          , string vId_Grupo_Envio, string vId_Entidad, string vPuntoEntrada, int vPeriodicidad, int? vSumaFechaDatos, string pNombreFichero, bool vEsIndividual,
+            string vReportingEntity, string pUtfConBom, out string pRutaServidor)
+        {
+
+            // Control de directorio TEMPORAL
+            string pathBase = string.Empty;
+            try
+            {
+                if (String.IsNullOrEmpty(Configuracion.getCache("pathXBRL")))
+                    pathBase = "C:";
+                else
+                    pathBase = Configuracion.getCache("pathXBRL");
+
+                if (!Directory.Exists(pathBase + "\\TempJSON"))
+                {
+                    Directory.CreateDirectory(pathBase + "\\TempJSON");
+                }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                throw new UnauthorizedAccessException(ex.Message);
+            }
+            catch (Exception e)
+            {
+                throw new Exception(e.Message);
+            }
+
+            // Se actualiza la BD para almacenar la ruta del fichero recién generado
+            string ficheroCompleto = String.Format("{0}\\{1}", pathBase, pNombreFichero);
+            string ruta = ficheroCompleto.Substring(0, ficheroCompleto.LastIndexOf("\\") + 1);
+            string nombreYextension = ficheroCompleto.Substring(ruta.Length, ficheroCompleto.Length - ruta.Length);
+            int indicePunto = nombreYextension.LastIndexOf('.');
+            string nombre;
+
+            if (indicePunto >= 0)
+            {
+                nombre = nombreYextension.Substring(0, indicePunto);
+            }   
+            else
+            {
+                nombre = nombreYextension; // No tiene extensión
+                nombreYextension = nombreYextension + ".json";
+                //string nombre = nombreYextension.Substring(0, nombreYextension.LastIndexOf('.'));
+            }
+
+            string dirName = (!pNombreFichero.Contains(".zip")) ? nombreYextension : nombre;
+            string pathTemporal = "" + pathBase + "\\TempJSON\\" + dirName;
+
+            #region // Creación de directorio random
+
+            if (Directory.Exists(pathTemporal))
+            {
+                Directory.Delete(pathTemporal);
+            }
+            Directory.CreateDirectory(pathTemporal);
+
+            #endregion
+
+
+            string pPathNombreFichero = String.Format("{0}\\TempJSON\\{1}", pathBase, pNombreFichero);
+
+            string nombreRandom = "";
+            int numeroSeguro;
+            do
+            {
+                numeroSeguro = GetCryptoInt32(1, 10000000);
+                nombreRandom = numeroSeguro + ".json";
+                pPathNombreFichero = String.Format("{0}\\TempJSON\\{1}", pathBase, nombreRandom);
+            } while (File.Exists(pPathNombreFichero));
+
+
+
+            Estado.GeneradorJSON genJSON = new Estado.GeneradorJSON();
+            string vFechaBarras = vFechaDatos.Substring(6, 2) + "/" + vFechaDatos.Substring(4, 2) + "/" + vFechaDatos.Substring(0, 4); // Formato 'DD/MM/YYYY'
+
+            MemoryStream ficheroResultado;
+            try
+            {
+                ficheroResultado = genJSON.ExportacionJSON(vIdSesion, pIdioma, vInformes, vFaltan, vFechaBarras, vId_Grupo_Envio, vId_Entidad, vPuntoEntrada
+                    , vPeriodicidad, vSumaFechaDatos, pPathNombreFichero, vEsIndividual, vReportingEntity, pUtfConBom);
+            }
+            catch (Exception ex)
+            {
+                string msgError = String.Format("ERROR ExportacionJSON: {0}", ex.Message);
+                SLB.ObjRemotos.TraceServidor.Trace.Show(vIdSesion, msgError + " - " + ex.StackTrace, 1, pIdioma);
+                throw new Estado.XBRLException(msgError);
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(nombreRandom) && File.Exists(nombreRandom)) File.Delete(pPathNombreFichero);
+            }
+
+
+
+
+            pRutaServidor = pPathNombreFichero;
+            /*
+            if (!pPathNombreFichero.Contains(".zip"))
+                pRutaServidor = String.Format("{0}.zip", pPathNombreFichero);
+            else
+                pRutaServidor = pPathNombreFichero;
+
+            // BORRAMOS EL DIRECTORIO TEMPORAL
+            Directory.Delete(pathTemporal, true);
+            if (!vGenerarEnServidor)
+            {               
+                File.Delete(pPathNombreFichero);
+            }
+            */
+            return ficheroResultado;
+        }
+
+        private static int GetCryptoInt32(int minValue, int maxValue)
+        {
+            if (minValue >= maxValue)
+                throw new ArgumentOutOfRangeException();
+
+            long range = (long)maxValue - minValue;
+            byte[] buffer = new byte[4];
+
+            using (var rng = new RNGCryptoServiceProvider())
+            {
+                while (true)
+                {
+                    rng.GetBytes(buffer);
+                    uint rand = BitConverter.ToUInt32(buffer, 0);
+                    long max = (1L + uint.MaxValue);
+                    long remainder = max % range;
+
+                    if (rand < max - remainder)
+                        return (int)(minValue + (rand % range));
+                }
+            }
+        }
+
+        private Dictionary<string, EstructuraJSON> ConstruirDiccionarioEstructuras(string vId_Grupo_Envio, string vFechaDatos)
+        {
+            string tmpFECHA_ALTA = string.Empty;
+
+            #region // Inicializamos configuración de conexion a BBDD
+            int bbdd = int.Parse(Configuracion.getCache("tipoBD"));
+
+            IManager iM = new IManager(bbdd);
+            string cadenaConexion = Configuracion.getCache("cadenaConexion");
+            string esquema = Configuracion.getCache("esquemaBD");
+            if (!esquema.Equals("")) esquema = esquema + ".";
+            string PAQUETE_XBRL_CSV = "P_EBEXC";
+            string paquete = PAQUETE_XBRL_CSV; // es el mismo que el JSON ya que comparten modelo
+            if (!String.IsNullOrEmpty(paquete))
+            {
+                if (bbdd == IManager.BD_Oracle)
+                    paquete = paquete + ".";
+                else
+                    paquete = paquete + "_";
+            }
+            #endregion
+
+            DataTable dtDatosEsquema = null;
+            DataTable dtDatosEstructuras = null;
+
+            int nParamsCONF = (bbdd == SLB.Utils.ConstantesBD.BD_SQLServer) ? 2 : 4;
+            object[] tmpParamCONF = new object[nParamsCONF];
+            tmpParamCONF[0] = SIRBE.Utils.UtilsBBDD.ObjetoToDatos<string>(vId_Grupo_Envio);
+            tmpParamCONF[1] = SIRBE.Utils.UtilsBBDD.ObjetoToDatos<string>(vFechaDatos);
+
+            string nombreProdecimientonCONF = paquete + "USP_GET_JSON_FICH";
+
+            DataSet dsCONF = iM.ExecuteDataSet(cadenaConexion, nombreProdecimientonCONF, tmpParamCONF);
+
+            if (dsCONF != null && dsCONF.Tables != null && dsCONF.Tables.Count > 0)
+            {
+                dtDatosEsquema = dsCONF.Tables[0];
+                dtDatosEstructuras = dsCONF.Tables[1];
+            }
+
+            string tmpIdFichero;
+            string tmpNombreFIchero;
+            string puntoEntrada;
+
+            if (dtDatosEsquema != null && dtDatosEsquema.Rows.Count > 0)
+            {
+                DataRow dr = dtDatosEsquema.Rows[0];
+
+                tmpIdFichero = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ID_FICHERO"]);
+                tmpNombreFIchero = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["NOMBRE_FICHERO"]);
+                puntoEntrada = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["PUNTO_ENTRADA"]);
+                DateTime tmpFECHA = SIRBE.Utils.UtilsBBDD.DatosToObjeto<DateTime>(dr["FECHA_ALTA"]);
+                tmpFECHA_ALTA = tmpFECHA.ToString("dd/MM/yyyy", System.Globalization.CultureInfo.InvariantCulture);
+
+
+            }
+            else
+            {
+                tmpFECHA_ALTA = null;
+                tmpIdFichero = null;
+                tmpNombreFIchero = null;
+                puntoEntrada = null;
+
+                throw new Exception(String.Format("ERROR MotorJSON.GetDatosConfiguracionFicheroJSON. No se ha encontrado la configuración del fichero JSON '{0}', {1}.", vId_Grupo_Envio, vFechaDatos));
+            }
+
+            Dictionary<string, EstructuraJSON> diccionarioEstructuras = new Dictionary<string, EstructuraJSON>();
+
+            if (dtDatosEstructuras != null && dtDatosEstructuras.Rows.Count > 0)
+            {
+                foreach (DataRow dr in dtDatosEstructuras.Rows)
+                {
+                    string tmpClaveOficialInforme = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["CLAVE_OFICIAL_INFORME"]);
+                    string tmpCodPlantillaJSON = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["COD_PLANTILLA_JSON"]);
+                    string tmpEsOpcional = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ES_OPCIONAL"]);
+                    string tmpTipoMotor = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["TIPO_DATO_MOTOR_EXP"]);
+                    string tmpOrdenFichero = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ORDEN_FICHERO"]); // uso futuro
+                    string tmpVariacion = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["VARIACION"]);
+                    string tmpNombreEstructura = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["NOMBRE_ESTRUCTURA"]);
+                    string tmpOrdenEstructura = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ORDEN_ESTRUCTURA"]); // uso futuro
+                    string tmpUniqueKeys = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["UNIQUE_KEYS"]);
+
+                    TiposEstructurasJSON tipoEstructura;
+
+                    if (tmpTipoMotor == "CUADRICULA")
+                    {
+                        tipoEstructura = TiposEstructurasJSON.CUADRICULA;
+                    }
+                    else if (tmpTipoMotor == "CUADRICULA-VAR_LOCAL")
+                    {
+                        tipoEstructura = TiposEstructurasJSON.CUADRICULA_VARLOCAL;
+                    }
+                    else // "CUADRICULA-VAR_GLOBAL"
+                    {
+                        tipoEstructura = TiposEstructurasJSON.CUADRICULA_VARGLOBAL;
+                    }
+
+                    bool esOpcional = tmpEsOpcional == "1";
+
+                    if (!diccionarioEstructuras.ContainsKey(tmpNombreEstructura))
+                    {
+                        diccionarioEstructuras.Add(tmpNombreEstructura, new EstructuraJSON(tipoEstructura, tmpNombreEstructura, tmpUniqueKeys));
+                        diccionarioEstructuras[tmpNombreEstructura].addEstado(tmpClaveOficialInforme, tmpCodPlantillaJSON, tmpOrdenFichero, esOpcional);
+                    }
+                    else
+                    {
+                        diccionarioEstructuras[tmpNombreEstructura].addEstado(tmpClaveOficialInforme, tmpCodPlantillaJSON, tmpOrdenFichero, esOpcional);
+                    }
+
+
+                }
+
+
+            }
+
+            return diccionarioEstructuras;
+        }
+
+        public KeyValuePair<string, EstructuraJSON> GetDatosCasillasJSON_Valor(string vIdSesion, string pIdioma, InformeSecuencia informe, string vId_Grupo_Envio,
+           string tmpFECHA_ALTA, string vFechaDatos, string vId_Entidad, string vPuntoEntrada)
+        {
+            #region MotorJSON.GetDatosCasillasJSON_Valor llamada al procedimiento P_EBEXC_USP_GET_JSON_EST
+
+            #region Variables
+            string PAQUETE_XBRL_CSV = "P_EBEXC";
+            string paquete = PAQUETE_XBRL_CSV;
+            int bbdd = int.Parse(Configuracion.getCache("tipoBD"));
+            string cadenaConexion = Configuracion.getCache("cadenaConexion");
+            IManager iM = new IManager(bbdd);
+            Dictionary<string, EstructuraJSON> diccionarioEstructuras = ConstruirDiccionarioEstructuras(vId_Grupo_Envio, vFechaDatos);
+            DataTable dtCeldasEst = null;
+            
+            if (!String.IsNullOrEmpty(paquete))
+            {
+                if (bbdd == IManager.BD_Oracle)
+                    paquete = paquete + ".";
+                else
+                    paquete = paquete + "_";
+            }
+            #endregion
+
+            TraceServidor.Trace.Show(vIdSesion, string.Format("MotorJSON.GetDatosCasillasJSON. Inicio {5}_USP_GET_JSON_EST Informe {0}, Grupo {1}, Sec. {2}, Fecha {3}, PE {4}", informe.Id_Informe, vId_Grupo_Envio, informe.Secuencia, vFechaDatos, vPuntoEntrada, PAQUETE_XBRL_CSV), 4, pIdioma);
+
+            int nParamsEST = (bbdd == SLB.Utils.ConstantesBD.BD_SQLServer) ? 6 : 8;
+            object[] tmpParamEST = new object[nParamsEST];
+            tmpParamEST[0] = SIRBE.Utils.UtilsBBDD.ObjetoToDatos<string>(vId_Grupo_Envio);
+            tmpParamEST[1] = SIRBE.Utils.UtilsBBDD.ObjetoToDatos<string>(tmpFECHA_ALTA);
+            tmpParamEST[2] = SIRBE.Utils.UtilsBBDD.ObjetoToDatos<string>(informe.Id_Informe);
+            tmpParamEST[3] = SIRBE.Utils.UtilsBBDD.ObjetoToDatos<string>(vFechaDatos);
+            tmpParamEST[4] = SIRBE.Utils.UtilsBBDD.ObjetoToDatos<string>(informe.Secuencia.ToString());
+            tmpParamEST[5] = SIRBE.Utils.UtilsBBDD.ObjetoToDatos<string>(vId_Entidad);
+
+            string nombreProdecimientonEST = paquete + "USP_GET_JSON_EST";
+
+            DataSet dsEST = iM.ExecuteDataSet(cadenaConexion, nombreProdecimientonEST, tmpParamEST);
+
+            int rowsEST = 0;
+            if (dsEST != null && dsEST.Tables != null && dsEST.Tables.Count > 0)
+            {
+                dtCeldasEst = dsEST.Tables[0];
+            }
+
+            TraceServidor.Trace.Show(vIdSesion, string.Format("MotorJSON.GetDatosCasillasJSON. Fin {6}_USP_GET_JSON_EST Informe {0}, Grupo {1}, Sec. {2}, Fecha {3}, PE {4}. N: {5}", informe.Id_Informe, vId_Grupo_Envio, informe.Secuencia, vFechaDatos, vPuntoEntrada, rowsEST, PAQUETE_XBRL_CSV), 4, pIdioma);
+
+            foreach (DataRow dr in dtCeldasEst.Rows)
+            {
+                string tmpClaveOficialInforme = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["CLAVE_OFICIAL_INFORME"]);
+                string tmpID_CELDA = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ID_CELDA"]);
+                string tmpID_FICHERO = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ID_FICHERO"]);
+                string tmpNOMBRE_ESTRUCTURA = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["NOMBRE_ESTRUCTURA"]);
+                string tmpNOMBRE_CAMPO_FICHERO = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["NOMBRE_CAMPO_FICHERO"]);
+                string tmpDONDE_ESTA_EL_VALOR = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["DONDE_ESTA_EL_VALOR"]);
+                string tmpID_TIPO_DATO = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ID_TIPO_DATO"]);
+                string tmpDECIMALES = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["DECIMALES"]);
+                string tmpUNIDADES = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["UNIDADES"]);
+                string tmpIdInforme = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ID_INFORME"]);
+                string tmpID_SUBINFORME = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ID_SUBINFORME"]);
+                string tmpID_VARIACION_1 = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ID_VARIACION_1"]);
+                string tmpID_VARIACION_2 = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ID_VARIACION_2"]);
+                string tmpID_VARIACION_FILA = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["ID_VARIACION_FILA"]);
+                string tmpCODIGO_CASILLA = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["CODIGO_CASILLA"]);
+                string tmpFORMATO = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["FORMATO"]);
+                string tmpVALOR = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["VALOR"]);
+                string usosDeNull = SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(dr["USOS_DE_NULL"]); //se usa para saber si se debe añadir la casilla en caso de ser una casilla vacia o no.
+
+                string valorFinal;
+                // BUSCAMOS EN diccionarioEstructuras donde esta la estructura y desp+ues en donde está el id_celda
+
+                /*
+                if (string.IsNullOrEmpty(tmpDECIMALES))
+                {
+                    tmpDECIMALES = "2";
+                }
+                */
+
+                //----------------------------------------------CASILLAS AFA----------------------------------------------
+                //19/11/2025 PHP: 
+                //Hay casillas que no deben incluirse en el Json.
+                //Las casillas que sean cadenas de texto (tmpID_TIPO_DATO == "s"), que sean vacias y no sean requeridas "required" se saltarán. Como si fuera un "Omitir Casillas" para la AFA
+                //En cuanto al resto de casillas siempre se enviaran, debido a que las casillas de números nunca son vacias, siempre tiene un 0, por tanto, han pedido que sean enviadas
+                //El campo "Requiered" se obtiene de T_EBEXC_CELDA la columna "USOS_DE_MULL", teoricamente solo deberia tener dos opciones "required" o NULL.
+
+                if (usosDeNull != "required" && tmpID_TIPO_DATO == "s" && string.IsNullOrWhiteSpace(tmpVALOR))
+                {
+                    continue; //Siguiente fila
+                }
+                //----------------------------------------------CASILLAS AFA----------------------------------------------
+
+                if (string.IsNullOrEmpty(tmpDONDE_ESTA_EL_VALOR))
+                {
+                    if (string.IsNullOrEmpty(tmpVALOR))
+                    {
+                        if (tmpID_TIPO_DATO == "s") // strings
+                        {
+                            valorFinal = "\"\"";
+                        }
+                        else
+                        {
+                            valorFinal = "";
+                        }
+                    }
+                    else
+                    {
+                        // PARSEO DIRECTO
+                        // CAMPO_FICHERO: VALOR si no es nulo
+
+                        if (tmpID_TIPO_DATO == "s") // strings
+                        {
+                            valorFinal = "\"" + tmpVALOR + "\"";
+                        }
+                        else if (tmpID_TIPO_DATO == "i")    // enteros
+                        {
+                            //valorFinal = tmpVALOR;
+                            valorFinal = utlsGeneradorXBRL.fGetEntero(tmpVALOR);
+                        }
+                        else if (tmpID_TIPO_DATO == "d")    // decimales
+                        {
+                            if (!string.IsNullOrEmpty(tmpDECIMALES))
+                            {
+                                string aux;
+
+                                aux = utlsGeneradorXBRL.fGetNumConDecimales(tmpVALOR, int.Parse(tmpDECIMALES));
+
+                                // Si está relleno el decimal que salga siempre con el numero concreto de decimales
+
+                                valorFinal = aux;
+                                /*
+                                if (aux.Contains("."))
+                                {
+                                    string valorTrimmed0 = aux.TrimEnd('0');
+                                    valorFinal = valorTrimmed0.TrimEnd('.');
+                                }
+                                else
+                                {
+                                    valorFinal = aux;
+                                }
+                                */
+                            }
+                            else
+                            {
+                                // si no esta indicado el numero de decimales chekeo el formato
+                                int posNumerico = tmpFORMATO.IndexOf("_");
+                                posNumerico++;
+                                string numDec = tmpFORMATO.Substring(posNumerico, tmpFORMATO.Length - posNumerico);
+                                int numeroDec = 0;
+                                try
+                                {
+                                    numeroDec = int.Parse(numDec);
+                                }
+                                catch
+                                {
+                                    numeroDec = 4;
+                                }
+
+                                string aux;
+
+                                aux = utlsGeneradorXBRL.fGetNumConDecimales(tmpVALOR, numeroDec);
+
+                                if (aux.Contains("."))
+                                {
+                                    string valorTrimmed0 = aux.TrimEnd('0');
+                                    valorFinal = valorTrimmed0.TrimEnd('.');
+                                }
+                                else
+                                {
+                                    valorFinal = aux;
+                                }
+                            }
+                        }
+                        else if (tmpID_TIPO_DATO == "p") // porcentaje
+                        {
+                            if (!string.IsNullOrEmpty(tmpDECIMALES))
+                            {
+                                valorFinal = utlsGeneradorXBRL.fGetNumConDecimales(tmpVALOR, int.Parse(tmpDECIMALES));
+                            }
+                            else
+                            {
+                                // si no esta indicado el numero de decimales chekeo el formato
+                                int posNumerico = tmpFORMATO.IndexOf("_");
+                                posNumerico++;
+                                string numDec = tmpFORMATO.Substring(posNumerico, tmpFORMATO.Length - posNumerico);
+                                int numeroDec = 0;
+                                try
+                                {
+                                    numeroDec = int.Parse(numDec);
+                                }
+                                catch
+                                {
+                                    numeroDec = 2;
+                                }
+
+                                string aux;
+
+                                aux = utlsGeneradorXBRL.fGetNumConDecimales(tmpVALOR, numeroDec);
+
+                                if (aux.Contains("."))
+                                {
+                                    string valorTrimmed0 = aux.TrimEnd('0');
+                                    valorFinal = valorTrimmed0.TrimEnd('.');
+                                }
+                                else
+                                {
+                                    valorFinal = aux;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            valorFinal = "";
+                            throw new Exception(String.Format("ERROR MotorJSON.GetDatosCasillasJSON. Encontrado ID_TIPO_DATO no soportado '{0}', {1}: {2}.", informe.Id_Informe, tmpID_CELDA, tmpID_TIPO_DATO));
+                        }
+                    }
+
+
+
+                    //Si valorFinal es vacío o 0 o 0.0 o 0.00 o 0.000 o 0.000...... --> ¿Gestión de ceros?
+
+
+                }
+                else
+                {
+                    // Checkeo del contenido 
+                    if (tmpDONDE_ESTA_EL_VALOR == "RGI.VG1")
+                    {
+                        valorFinal = tmpID_VARIACION_1;
+                    }
+                    else if (tmpDONDE_ESTA_EL_VALOR == "RGI.VG2")
+                    {
+                        valorFinal = tmpID_VARIACION_2;
+                    }
+                    else if (tmpDONDE_ESTA_EL_VALOR == "RGI.VL")
+                    {
+                        valorFinal = tmpID_VARIACION_FILA;
+                    }
+                    else if (tmpDONDE_ESTA_EL_VALOR.StartsWith("RGI.VALOR"))
+                    {
+                        // RGI.VALOR, casillas:{XXXX}_{YYYY}
+                        string[] casillasBuscadas = tmpDONDE_ESTA_EL_VALOR.Split(':')[1].Split('_');
+
+                        DataRow[] drVLs = dtCeldasEst.Rows.Cast<DataRow>().Where(r => SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(r["ID_VARIACION_1"]) == tmpID_VARIACION_1
+                                                                                        && SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(r["ID_VARIACION_2"]) == tmpID_VARIACION_2
+                                                                                        && SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(r["ID_VARIACION_FILA"]) == tmpID_VARIACION_FILA
+                                                                                        && SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(r["ID_SUBINFORME"]) == tmpID_SUBINFORME
+                                                                                        && casillasBuscadas.Contains(SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(r["CODIGO_CASILLA"]))
+                                        )//.ToDictionary;
+                                        .ToArray();
+                        valorFinal = "";
+                        foreach (DataRow drVL in drVLs)
+                        {
+                            if (tmpVALOR == "")
+                            {
+                                tmpVALOR += SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(drVL["VALOR"]);
+                            }
+                            else
+                            {
+                                tmpVALOR += "_" + SIRBE.Utils.UtilsBBDD.DatosToObjeto<string>(drVL["VALOR"]);
+                            }
+                        }
+                    }
+                    else if (tmpDONDE_ESTA_EL_VALOR.StartsWith("\"") && tmpDONDE_ESTA_EL_VALOR.EndsWith("\""))
+                    {
+                        valorFinal = tmpDONDE_ESTA_EL_VALOR;
+                    }
+                    else
+                    {
+                        valorFinal = "";
+                        throw new Exception(String.Format("ERROR MotorJSON.GetDatosCasillasJSON. Encontrado DONDE_ESTA_EL_VALOR no soportado '{0}', {1}: {2}.", informe.Id_Informe, tmpID_CELDA, tmpDONDE_ESTA_EL_VALOR));
+                    }
+                }
+
+                // Guardamos los valores por estado
+                if (!string.IsNullOrEmpty(valorFinal))
+                {
+                    string posicionCelda = tmpIdInforme + "_" + tmpID_SUBINFORME + "_" + tmpID_VARIACION_1 + "_" + tmpID_VARIACION_2 + "_" + tmpID_VARIACION_FILA;
+                    CeldaJSON celda = new CeldaJSON(tmpIdInforme, tmpID_SUBINFORME, tmpID_VARIACION_1, tmpID_VARIACION_2, tmpID_VARIACION_FILA, tmpCODIGO_CASILLA, tmpID_CELDA, valorFinal, tmpNOMBRE_ESTRUCTURA, tmpDONDE_ESTA_EL_VALOR);
+                    diccionarioEstructuras[tmpNOMBRE_ESTRUCTURA].addCelda(posicionCelda, celda);
+                }
+            }
+            #endregion
+            KeyValuePair<string, EstructuraJSON> parejita = new KeyValuePair<string, EstructuraJSON>(diccionarioEstructuras.Keys.First(), diccionarioEstructuras.Values.First());
+
+            return parejita;
+        }
+    }
+}
